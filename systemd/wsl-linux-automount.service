@@ -1,0 +1,14 @@
+[Unit]
+Description=WSL2 Generic Linux Drive Auto-Mount Service (Engineered by AI)
+After=network.target systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wsl-linux-automount
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

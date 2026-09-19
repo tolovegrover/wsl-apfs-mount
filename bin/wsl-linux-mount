@@ -1,0 +1,521 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# wsl-linux-mount
+# ------------------------------------------------------------------------------
+# Generic utility to detect, attach, and mount Linux drives (external USB or
+# internal disks containing ext4, btrfs, xfs, f2fs) into WSL2.
+#
+# FULL AI DISCLOSURE:
+# This software was conceptualized, designed, and implemented entirely by
+# AI (Antigravity by Google DeepMind) in an interactive pair-programming session
+# with Love Grover (@tolovegrover).
+#
+# License: MIT License
+# ==============================================================================
+
+set -euo pipefail
+
+VERSION="1.0.0"
+DEFAULT_MOUNT_BASE="/mnt/disks"
+
+# Colors for terminal output
+BOLD='\033[1m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+print_banner() {
+    cat << "EOF"
+ _       ______  __       __    _____   __  ___  ___  __
+| |     / / __ \/ /      / /   /  _/ | / / / / / / / / /
+| | /| / / /_/ / /      / /    / / /  |/ / / / / / / / / 
+| |/ |/ /\__, / /___   / /____/ / / /|  / / /_/ / /_/ /  
+|__/|__//____/_____/  /_____/___//_/ |_/  \____/\____/   
+                                 MOUNT (WSL2)
+EOF
+    echo -e "${DIM}Version ${VERSION} | Generic Linux Filesystem Mounter for WSL2${NC}"
+    echo -e "${CYAN}🤖 Full AI Disclosure: Engineered by AI (Google DeepMind Antigravity) & @tolovegrover${NC}\n"
+}
+
+log_info() {
+    echo -e "${BLUE}[*]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[✗]${NC} $1" >&2
+}
+
+get_powershell_path() {
+    if command -v powershell.exe >/dev/null 2>&1; then
+        echo "powershell.exe"
+    elif [ -x "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" ]; then
+        echo "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    else
+        echo ""
+    fi
+}
+
+get_usbipd_path() {
+    if command -v usbipd.exe >/dev/null 2>&1; then
+        echo "usbipd.exe"
+    elif [ -x "/mnt/c/Program Files/usbipd-win/usbipd.exe" ]; then
+        echo "/mnt/c/Program Files/usbipd-win/usbipd.exe"
+    else
+        echo ""
+    fi
+}
+
+# Exclude WSL internal system disks (root, swap, system init)
+is_system_disk() {
+    local dev="$1"
+    # Root filesystem partition
+    local root_dev
+    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    if [ "$dev" = "$root_dev" ] || echo "$dev" | grep -qE '^/dev/sd[a-d]'; then
+        return 0
+    fi
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# Command: list
+# ------------------------------------------------------------------------------
+cmd_list() {
+    print_banner
+    log_info "Scanning for Linux partitions and attached drives..."
+    echo ""
+
+    echo -e "${BOLD}1. Block Devices in WSL (Linux Filesystems):${NC}"
+    local found=0
+    while IFS= read -r dev; do
+        if [ -n "$dev" ] && ! is_system_disk "$dev"; then
+            local blk_info
+            blk_info=$(sudo blkid "$dev" 2>/dev/null || true)
+            local fstype
+            fstype=$(echo "$blk_info" | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || true)
+            if [[ "$fstype" =~ ^(ext4|ext3|ext2|btrfs|xfs|f2fs|vfat)$ ]]; then
+                local label
+                label=$(echo "$blk_info" | grep -o 'LABEL="[^"]*"' | cut -d'"' -f2 || true)
+                [ -z "$label" ] && label=$(echo "$blk_info" | grep -o 'PARTLABEL="[^"]*"' | cut -d'"' -f2 || echo "No label")
+                local uuid
+                uuid=$(echo "$blk_info" | grep -E -o '\bUUID="[^"]*"' | head -n1 | cut -d'"' -f2 || echo "Unknown")
+                local size
+                size=$(lsblk -no SIZE "$dev" 2>/dev/null || echo "Unknown")
+                local mnt
+                mnt=$(lsblk -no MOUNTPOINTS "$dev" 2>/dev/null || echo "unmounted")
+                [ -z "$mnt" ] && mnt="unmounted"
+                echo -e "  ${GREEN}●${NC} ${BOLD}$dev${NC} [$fstype] Size: $size | Label: \"$label\" | UUID: $uuid | Mount: $mnt"
+                found=1
+            fi
+        fi
+    done < <(lsblk -lpno NAME 2>/dev/null | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "  ${DIM}(No non-system Linux partitions currently detected inside WSL block devices)${NC}"
+    fi
+    echo ""
+
+    local usbipd_cmd
+    usbipd_cmd=$(get_usbipd_path)
+    if [ -n "$usbipd_cmd" ]; then
+        echo -e "${BOLD}2. USB Devices on Windows Host (usbipd-win):${NC}"
+        local usb_list
+        usb_list=$("$usbipd_cmd" list </dev/null 2>/dev/null || true)
+        if [ -n "$usb_list" ]; then
+            echo "$usb_list"
+        fi
+        echo ""
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: status
+# ------------------------------------------------------------------------------
+cmd_status() {
+    print_banner
+    log_info "Checking active Linux drive mounts..."
+    echo ""
+
+    local active_mounts
+    active_mounts=$(mount -t ext4,ext3,ext2,btrfs,xfs,f2fs 2>/dev/null | grep -E '^/dev/sd[e-z]' || true)
+
+    if [ -n "$active_mounts" ]; then
+        echo -e "${GREEN}${BOLD}Active External Linux Drive Mounts:${NC}"
+        echo "$active_mounts"
+        echo ""
+        echo -e "${BOLD}Filesystem Usage:${NC}"
+        while IFS= read -r line; do
+            local mnt
+            mnt=$(echo "$line" | awk '{print $3}')
+            df -h "$mnt"
+            local win_path
+            win_path=$(wslpath -w "$mnt" 2>/dev/null || true)
+            echo -e "  Linux Path:   ${CYAN}${BOLD}$mnt${NC}"
+            [ -n "$win_path" ] && printf "  Windows Path: %b%s%b\n" "$CYAN" "$win_path" "$NC"
+            echo ""
+        done <<< "$active_mounts"
+    else
+        log_warn "No external Linux filesystems currently mounted in WSL."
+        echo -e "Use ${BOLD}wsl-linux-mount mount${NC} to mount a drive."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: mount
+# ------------------------------------------------------------------------------
+cmd_mount() {
+    local device=""
+    local mountpoint=""
+    local mode="ro" # default read-only for safety
+    local explore=0
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ro|-r)
+                mode="ro"
+                shift
+                ;;
+            --rw|-w)
+                mode="rw"
+                shift
+                ;;
+            --explore|-e)
+                explore=1
+                shift
+                ;;
+            /dev/*)
+                device="$1"
+                shift
+                ;;
+            /*)
+                mountpoint="$1"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Auto-detect device if not specified
+    if [ -z "$device" ]; then
+        log_info "Scanning for available Linux partitions..."
+        local candidates=()
+        while IFS= read -r dev; do
+            if [ -n "$dev" ] && ! is_system_disk "$dev"; then
+                local blk_info
+                blk_info=$(sudo blkid "$dev" 2>/dev/null || true)
+                local fstype
+                fstype=$(echo "$blk_info" | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || true)
+                if [[ "$fstype" =~ ^(ext4|ext3|ext2|btrfs|xfs|f2fs)$ ]]; then
+                    candidates+=("$dev")
+                fi
+            fi
+        done < <(lsblk -lpno NAME 2>/dev/null | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+
+        if [ ${#candidates[@]} -eq 0 ]; then
+            log_warn "No external Linux partitions attached inside WSL."
+            log_info "Checking Windows host for connected USB storage drives..."
+
+            local usbipd_cmd
+            usbipd_cmd=$(get_usbipd_path)
+            local attached_busid=""
+
+            if [ -n "$usbipd_cmd" ]; then
+                local usb_lines
+                usb_lines=$("$usbipd_cmd" list </dev/null 2>/dev/null | grep -E '^[0-9]+-[0-9]+.*Mass Storage' || true)
+
+                if [ -n "$usb_lines" ]; then
+                    local busids=()
+                    local descs=()
+                    while IFS= read -r uline; do
+                        local b_id
+                        b_id=$(echo "$uline" | awk '{print $1}')
+                        local desc
+                        desc=$(echo "$uline" | awk '{$1=$2=""; print $0}' | sed 's/^[ \t]*//')
+                        busids+=("$b_id")
+                        descs+=("$desc")
+                    done <<< "$usb_lines"
+
+                    if [ ${#busids[@]} -eq 1 ]; then
+                        log_info "Found USB device: ${BOLD}${busids[0]}${NC} - ${descs[0]}"
+                        attached_busid="${busids[0]}"
+                    else
+                        log_warn "Multiple USB storage devices detected on Windows:"
+                        for i in "${!busids[@]}"; do
+                            echo "  [$i] ${busids[$i]} - ${descs[$i]}"
+                        done
+                        read -rp "Select USB device to attach (0-$((${#busids[@]}-1))): " uchoice
+                        attached_busid="${busids[$uchoice]}"
+                    fi
+
+                    # Bind if not shared
+                    local state
+                    state=$("$usbipd_cmd" list </dev/null 2>/dev/null | grep "^$attached_busid" | awk '{print $NF}' || true)
+                    if [ "$state" != "shared" ] && [ "$state" != "Shared" ] && [ "$state" != "Attached" ]; then
+                        log_info "Requesting Administrator elevation on Windows to share device $attached_busid..."
+                        local ps_cmd
+                        ps_cmd=$(get_powershell_path)
+                        if [ -n "$ps_cmd" ]; then
+                            "$ps_cmd" -NoProfile -NonInteractive -Command "Start-Process powershell -ArgumentList '-NoProfile -Command usbipd bind --busid $attached_busid' -Verb RunAs -Wait" </dev/null 2>/dev/null || true
+                        fi
+                    fi
+
+                    log_info "Attaching USB device $attached_busid to WSL..."
+                    "$usbipd_cmd" attach --wsl -b "$attached_busid" </dev/null 2>/dev/null || true
+                    log_info "Waiting for kernel to register block device..."
+                    sleep 3
+
+                    # Rescan
+                    while IFS= read -r dev; do
+                        if [ -n "$dev" ] && ! is_system_disk "$dev"; then
+                            local blk_info
+                            blk_info=$(sudo blkid "$dev" 2>/dev/null || true)
+                            local fstype
+                            fstype=$(echo "$blk_info" | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || true)
+                            if [[ "$fstype" =~ ^(ext4|ext3|ext2|btrfs|xfs|f2fs)$ ]]; then
+                                candidates+=("$dev")
+                            fi
+                        fi
+                    done < <(lsblk -lpno NAME 2>/dev/null | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+                fi
+            fi
+
+            if [ ${#candidates[@]} -eq 0 ]; then
+                log_error "No Linux partitions found."
+                echo "Connect your Linux drive and attach it via usbipd or wsl --mount."
+                exit 1
+            fi
+        fi
+
+        if [ ${#candidates[@]} -eq 1 ]; then
+            device="${candidates[0]}"
+            log_info "Target Linux partition: ${BOLD}$device${NC}"
+        else
+            log_warn "Multiple Linux partitions found:"
+            for i in "${!candidates[@]}"; do
+                echo "  [$i] ${candidates[$i]}"
+            done
+            read -rp "Select partition index: " pchoice
+            device="${candidates[$pchoice]}"
+        fi
+    fi
+
+    # Determine default mountpoint if not provided
+    if [ -z "$mountpoint" ]; then
+        local blk_info
+        blk_info=$(sudo blkid "$device" 2>/dev/null || true)
+        local label
+        label=$(echo "$blk_info" | grep -o 'LABEL="[^"]*"' | cut -d'"' -f2 || true)
+        if [ -n "$label" ]; then
+            # Clean label for filesystem path
+            local clean_label
+            clean_label=$(echo "$label" | tr ' /' '__')
+            mountpoint="$DEFAULT_MOUNT_BASE/$clean_label"
+        elif echo "$blk_info" | grep -q "71f2bbfc-9d89-4791-b7b6-12de5e533778"; then
+            mountpoint="/mnt/sandisk_arch"
+        else
+            local dev_name
+            dev_name=$(basename "$device")
+            mountpoint="$DEFAULT_MOUNT_BASE/$dev_name"
+        fi
+    fi
+
+    if mount | grep -q "on $mountpoint "; then
+        log_warn "$mountpoint is already mounted."
+        cmd_status
+        return 0
+    fi
+
+    log_info "Creating mount point: ${BOLD}$mountpoint${NC}"
+    sudo mkdir -p "$mountpoint"
+
+    log_info "Mounting ${BOLD}$device${NC} in ${GREEN}${mode^^}${NC} mode to ${BOLD}$mountpoint${NC}..."
+    if sudo mount -o "$mode" "$device" "$mountpoint"; then
+        log_success "Linux partition mounted successfully!"
+        echo ""
+        echo -e "  ${BOLD}Device:${NC}       ${CYAN}$device${NC}"
+        echo -e "  ${BOLD}Mount Point:${NC}  ${CYAN}$mountpoint${NC}"
+        echo -e "  ${BOLD}Access Mode:${NC}  ${GREEN}${mode^^}${NC}"
+
+        local win_path=""
+        if command -v wslpath >/dev/null 2>&1; then
+            win_path=$(wslpath -w "$mountpoint" 2>/dev/null || true)
+            if [ -n "$win_path" ]; then
+                printf "  %bWindows Path:%b   %b%s%b\n" "$BOLD" "$NC" "$CYAN" "$win_path" "$NC"
+            fi
+        fi
+        echo ""
+        echo -e "Browse your files directly in WSL:"
+        echo -e "  ${BOLD}cd $mountpoint && ls -la${NC}"
+        if [ -n "$win_path" ]; then
+            echo -e "Or in Windows File Explorer via:"
+            printf "  %s\n" "$win_path"
+        fi
+
+        if [ "$explore" -eq 1 ] && [ -n "$win_path" ]; then
+            explorer.exe "$win_path" 2>/dev/null || true
+        fi
+    else
+        log_error "Failed to mount $device to $mountpoint."
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: unmount / umount
+# ------------------------------------------------------------------------------
+cmd_unmount() {
+    local mountpoint="${1:-}"
+
+    if [ -z "$mountpoint" ]; then
+        local active_mounts
+        active_mounts=$(mount | grep -E '^/dev/sd[e-z]' | awk '{print $3}' || true)
+        if [ -z "$active_mounts" ]; then
+            log_warn "No external Linux drives are currently mounted."
+            return 0
+        fi
+        for mnt in $active_mounts; do
+            log_info "Unmounting $mnt..."
+            sudo umount "$mnt" || sudo umount -l "$mnt"
+            log_success "Unmounted $mnt."
+        done
+        return 0
+    fi
+
+    if ! mount | grep -q "on $mountpoint "; then
+        log_warn "$mountpoint is not currently mounted."
+        return 0
+    fi
+
+    log_info "Unmounting ${BOLD}$mountpoint${NC}..."
+    sudo umount "$mountpoint" || sudo umount -l "$mountpoint"
+    log_success "Successfully unmounted $mountpoint."
+}
+
+# ------------------------------------------------------------------------------
+# Command: automount (systemd management)
+# ------------------------------------------------------------------------------
+cmd_automount() {
+    local action="${1:-status}"
+
+    case "$action" in
+        enable)
+            log_info "Enabling and starting wsl-linux-automount systemd service..."
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now wsl-linux-automount.service
+            log_success "wsl-linux-automount service enabled and started!"
+            sudo systemctl status wsl-linux-automount.service --no-pager
+            ;;
+        disable)
+            log_info "Disabling and stopping wsl-linux-automount systemd service..."
+            sudo systemctl disable --now wsl-linux-automount.service
+            log_success "wsl-linux-automount service disabled."
+            ;;
+        status)
+            sudo systemctl status wsl-linux-automount.service --no-pager || true
+            ;;
+        start)
+            sudo systemctl start wsl-linux-automount.service
+            log_success "wsl-linux-automount service started."
+            ;;
+        stop)
+            sudo systemctl stop wsl-linux-automount.service
+            log_success "wsl-linux-automount service stopped."
+            ;;
+        restart)
+            sudo systemctl restart wsl-linux-automount.service
+            log_success "wsl-linux-automount service restarted."
+            ;;
+        *)
+            log_error "Unknown automount action: $action"
+            echo "Usage: wsl-linux-mount automount [enable|disable|status|start|stop|restart]"
+            exit 1
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Help & Usage
+# ------------------------------------------------------------------------------
+show_help() {
+    print_banner
+    cat << EOF
+Usage: wsl-linux-mount <command> [options]
+
+Commands:
+  mount [device] [dir] [--ro|--rw]   Mount Linux partition (ext4, btrfs, xfs, etc.)
+  unmount [dir]                      Unmount Linux partition (alias: umount)
+  status                             Show active non-system Linux mounts
+  list                               Scan and list Linux drives on WSL and Windows host
+  automount <action>                 Manage systemd auto-mount service (enable|disable|status)
+  version                            Show version and AI disclosure
+  help                               Show this help message
+
+Options:
+  --ro, -r                           Mount read-only (default for safety)
+  --rw, -w                           Mount read-write
+  --explore, -e                      Open Windows File Explorer upon successful mount
+
+Examples:
+  wsl-linux-mount mount
+  wsl-linux-mount mount /dev/sdf2 /mnt/sandisk_arch --ro
+  wsl-linux-mount mount --rw
+  wsl-linux-mount status
+  wsl-linux-mount unmount /mnt/sandisk_arch
+  sudo wsl-linux-mount automount enable
+
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Entry Point
+# ------------------------------------------------------------------------------
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        mount|-m)
+            cmd_mount "$@"
+            ;;
+        unmount|umount|-u)
+            cmd_unmount "$@"
+            ;;
+        status|-s)
+            cmd_status
+            ;;
+        list|-l)
+            cmd_list
+            ;;
+        automount)
+            cmd_automount "$@"
+            ;;
+        version|-v|--version)
+            print_banner
+            ;;
+        help|-h|--help)
+            show_help
+            ;;
+        *)
+            log_error "Unknown command: $cmd"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

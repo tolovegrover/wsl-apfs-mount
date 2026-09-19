@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# wsl-linux-automount daemon
+#
+# Automatically monitors, mounts, and unmounts external Linux drives
+# (ext4, btrfs, xfs, f2fs) in WSL2 via systemd.
+#
+# FULL AI DISCLOSURE:
+# This software was conceptualized, designed, and implemented entirely by
+# AI (Antigravity by Google DeepMind) in an interactive pair-programming session
+# with Love Grover (@tolovegrover).
+#
+# License: MIT License
+# ==============================================================================
+
+set -euo pipefail
+
+DEFAULT_MOUNT_BASE="/mnt/disks"
+INTERVAL=2
+
+declare -A MOUNTED_DEVS
+
+is_system_disk() {
+    local dev="$1"
+    local root_dev
+    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+    if [ "$dev" = "$root_dev" ] || echo "$dev" | grep -qE '^/dev/sd[a-d]'; then
+        return 0
+    fi
+    return 1
+}
+
+cleanup() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Stopping wsl-linux-automount daemon..."
+    for dev in "${!MOUNTED_DEVS[@]}"; do
+        local mnt="${MOUNTED_DEVS[$dev]}"
+        if mount | grep -q "on $mnt "; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Unmounting $mnt..."
+            umount -l "$mnt" 2>/dev/null || true
+        fi
+    done
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+process_mounts() {
+    # 1. Verify existing mounts: clean up if block device is removed
+    for dev in "${!MOUNTED_DEVS[@]}"; do
+        local mnt="${MOUNTED_DEVS[$dev]}"
+        if [ ! -b "$dev" ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Block device $dev disconnected. Cleaning up $mnt..."
+            umount -l "$mnt" 2>/dev/null || true
+            unset "MOUNTED_DEVS[$dev]"
+        fi
+    done
+
+    # 2. Scan for unmounted external Linux partitions
+    while IFS= read -r dev; do
+        if [ -n "$dev" ] && [ -b "$dev" ] && ! is_system_disk "$dev"; then
+            local blk_info
+            blk_info=$(blkid "$dev" 2>/dev/null || true)
+            local fstype
+            fstype=$(echo "$blk_info" | grep -o 'TYPE="[^"]*"' | cut -d'"' -f2 || true)
+
+            if [[ "$fstype" =~ ^(ext4|ext3|ext2|btrfs|xfs|f2fs)$ ]]; then
+                # Check if this device is already mounted anywhere
+                if ! findmnt -n -o TARGET "$dev" >/dev/null 2>&1; then
+                    local label
+                    label=$(echo "$blk_info" | grep -o 'LABEL="[^"]*"' | cut -d'"' -f2 || true)
+                    local target_mnt=""
+
+                    if [ -n "$label" ]; then
+                        local clean_label
+                        clean_label=$(echo "$label" | tr ' /' '__')
+                        target_mnt="$DEFAULT_MOUNT_BASE/$clean_label"
+                    elif echo "$blk_info" | grep -q "71f2bbfc-9d89-4791-b7b6-12de5e533778"; then
+                        target_mnt="/mnt/sandisk_arch"
+                    else
+                        local dev_name
+                        dev_name=$(basename "$dev")
+                        target_mnt="$DEFAULT_MOUNT_BASE/$dev_name"
+                    fi
+
+                    mkdir -p "$target_mnt"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Discovered Linux device $dev ($fstype). Auto-mounting to $target_mnt..."
+                    if mount -o ro "$dev" "$target_mnt" 2>/dev/null; then
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully auto-mounted $dev to $target_mnt."
+                        MOUNTED_DEVS["$dev"]="$target_mnt"
+                    else
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to mount $dev to $target_mnt."
+                    fi
+                fi
+            fi
+        fi
+    done < <(lsblk -lpno NAME 2>/dev/null | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+}
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting wsl-linux-automount daemon..."
+mkdir -p "$DEFAULT_MOUNT_BASE"
+
+while true; do
+    process_mounts
+    sleep "$INTERVAL"
+done

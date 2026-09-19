@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# wsl-apfs-automount daemon
+#
+# Automatically monitors and mounts/unmounts APFS drives in WSL2 via systemd.
+#
+# FULL AI DISCLOSURE:
+# This software was conceptualized, designed, and implemented entirely by
+# AI (Antigravity by Google DeepMind) in an interactive pair-programming session
+# with Love Grover (@tolovegrover).
+#
+# License: MIT License
+# ==============================================================================
+
+set -euo pipefail
+
+MOUNTPOINT="${1:-/mnt/apfs}"
+TARGET_UID="${SUDO_UID:-1000}"
+TARGET_GID="${SUDO_GID:-1000}"
+INTERVAL=2
+
+CURRENT_DEV=""
+
+cleanup() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Stopping wsl-apfs-automount daemon..."
+    if mount | grep -q "on $MOUNTPOINT "; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Unmounting $MOUNTPOINT..."
+        fusermount3 -u "$MOUNTPOINT" 2>/dev/null || umount -l "$MOUNTPOINT" 2>/dev/null || true
+    fi
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting wsl-apfs-automount daemon (mountpoint: $MOUNTPOINT, interval: ${INTERVAL}s)..."
+
+mkdir -p "$MOUNTPOINT"
+chown "$TARGET_UID:$TARGET_GID" "$MOUNTPOINT" 2>/dev/null || true
+
+while true; do
+    # Check if currently mounted
+    if mount | grep -q "on $MOUNTPOINT "; then
+        # Verify the underlying block device still exists
+        if [ -n "$CURRENT_DEV" ] && [ ! -b "$CURRENT_DEV" ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Block device $CURRENT_DEV disconnected. Cleaning up mountpoint $MOUNTPOINT..."
+            fusermount3 -u "$MOUNTPOINT" 2>/dev/null || umount -l "$MOUNTPOINT" 2>/dev/null || true
+            CURRENT_DEV=""
+        fi
+    else
+        # Scan for an APFS partition
+        CURRENT_DEV=""
+        while IFS= read -r dev; do
+            if [ -n "$dev" ] && [ -b "$dev" ]; then
+                if blkid "$dev" 2>/dev/null | grep -qi "apfs"; then
+                    CURRENT_DEV="$dev"
+                    break
+                fi
+            fi
+        done < <(lsblk -lpno NAME 2>/dev/null | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+
+        if [ -n "$CURRENT_DEV" ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Discovered APFS device $CURRENT_DEV. Auto-mounting read-only to $MOUNTPOINT..."
+            if apfs-fuse -o "uid=$TARGET_UID,gid=$TARGET_GID,allow_other" "$CURRENT_DEV" "$MOUNTPOINT" 2>/dev/null; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully mounted $CURRENT_DEV to $MOUNTPOINT."
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to mount $CURRENT_DEV to $MOUNTPOINT."
+                CURRENT_DEV=""
+            fi
+        fi
+    fi
+
+    sleep "$INTERVAL"
+done

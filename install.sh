@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# wsl-apfs-mount installer
+# wsl-drive-mount Suite Installer (APFS + Generic Linux)
 #
 # FULL AI DISCLOSURE:
 # This software was conceptualized, designed, and implemented entirely by
@@ -10,27 +10,49 @@
 
 set -euo pipefail
 
-REPO_URL="https://raw.githubusercontent.com/tolovegrover/wsl-apfs-mount/main/bin/wsl-apfs-mount"
+BASE_URL="https://raw.githubusercontent.com/tolovegrover/wsl-apfs-mount/main"
 INSTALL_DIR="/usr/local/bin"
-TARGET="$INSTALL_DIR/wsl-apfs-mount"
+SYSTEMD_DIR="/etc/systemd/system"
 
-echo "==> Installing wsl-apfs-mount..."
+echo "==> Installing WSL Drive Mount Suite (APFS + Linux)..."
 
 if [ ! -d "$INSTALL_DIR" ]; then
     sudo mkdir -p "$INSTALL_DIR"
 fi
 
-if command -v curl >/dev/null 2>&1; then
-    sudo curl -fsSL "$REPO_URL" -o "$TARGET"
-elif command -v wget >/dev/null 2>&1; then
-    sudo wget -qO "$TARGET" "$REPO_URL"
-else
-    echo "Error: curl or wget is required to install wsl-apfs-mount." >&2
-    exit 1
+download_file() {
+    local src="$1"
+    local dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        sudo curl -fsSL "$src" -o "$dest"
+    elif command -v wget >/dev/null 2>&1; then
+        sudo wget -qO "$dest" "$src"
+    else
+        echo "Error: curl or wget is required." >&2
+        exit 1
+    fi
+}
+
+echo "  -> Installing binaries to $INSTALL_DIR..."
+download_file "$BASE_URL/bin/wsl-apfs-mount" "$INSTALL_DIR/wsl-apfs-mount"
+download_file "$BASE_URL/bin/wsl-apfs-automount" "$INSTALL_DIR/wsl-apfs-automount"
+download_file "$BASE_URL/bin/wsl-linux-mount" "$INSTALL_DIR/wsl-linux-mount"
+download_file "$BASE_URL/bin/wsl-linux-automount" "$INSTALL_DIR/wsl-linux-automount"
+
+sudo chmod +x "$INSTALL_DIR"/wsl-*
+
+if [ -d "$SYSTEMD_DIR" ]; then
+    echo "  -> Installing systemd auto-mount services..."
+    download_file "$BASE_URL/systemd/wsl-apfs-automount.service" "$SYSTEMD_DIR/wsl-apfs-automount.service"
+    download_file "$BASE_URL/systemd/wsl-linux-automount.service" "$SYSTEMD_DIR/wsl-linux-automount.service"
+    sudo systemctl daemon-reload || true
 fi
 
-sudo chmod +x "$TARGET"
-
-echo "==> wsl-apfs-mount installed successfully to $TARGET"
-echo "==> Run 'wsl-apfs-mount install-deps' to set up apfs-fuse and system build tools."
-echo "==> Run 'wsl-apfs-mount help' for usage instructions."
+echo "==> Installation complete!"
+echo "==> Available tools:"
+echo "    - wsl-apfs-mount   : Mount Apple APFS drives (read-only)"
+echo "    - wsl-linux-mount  : Mount generic Linux drives (ext4, btrfs, xfs, etc.)"
+echo ""
+echo "==> Enable auto-mounting via systemctl:"
+echo "    sudo systemctl enable --now wsl-apfs-automount"
+echo "    sudo systemctl enable --now wsl-linux-automount"

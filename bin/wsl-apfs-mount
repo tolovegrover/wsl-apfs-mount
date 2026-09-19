@@ -402,7 +402,7 @@ cmd_mount() {
         if command -v wslpath >/dev/null 2>&1; then
             win_path=$(wslpath -w "$mountpoint/root" 2>/dev/null || true)
             if [ -n "$win_path" ]; then
-                echo -e "  ${BOLD}Windows Path:${NC}   ${CYAN}${BOLD}$win_path${NC}"
+                printf "  %bWindows Path:%b   %b%s%b\n" "$BOLD" "$NC" "$CYAN" "$win_path" "$NC"
             fi
         fi
         echo ""
@@ -410,7 +410,7 @@ cmd_mount() {
         echo -e "  ${BOLD}cd $mountpoint/root && ls -la${NC}"
         if [ -n "$win_path" ]; then
             echo -e "Or browse directly in Windows File Explorer via:"
-            echo -e "  ${BOLD}$win_path${NC}"
+            printf "  %s\n" "$win_path"
         fi
     else
         log_error "Failed to mount $device to $mountpoint."
@@ -443,6 +443,48 @@ cmd_unmount() {
 }
 
 # ------------------------------------------------------------------------------
+# Command: automount (systemd management)
+# ------------------------------------------------------------------------------
+cmd_automount() {
+    local action="${1:-status}"
+
+    case "$action" in
+        enable)
+            log_info "Enabling and starting wsl-apfs-automount systemd service..."
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now wsl-apfs-automount.service
+            log_success "wsl-apfs-automount service enabled and started!"
+            sudo systemctl status wsl-apfs-automount.service --no-pager
+            ;;
+        disable)
+            log_info "Disabling and stopping wsl-apfs-automount systemd service..."
+            sudo systemctl disable --now wsl-apfs-automount.service
+            log_success "wsl-apfs-automount service disabled."
+            ;;
+        status)
+            sudo systemctl status wsl-apfs-automount.service --no-pager || true
+            ;;
+        start)
+            sudo systemctl start wsl-apfs-automount.service
+            log_success "wsl-apfs-automount service started."
+            ;;
+        stop)
+            sudo systemctl stop wsl-apfs-automount.service
+            log_success "wsl-apfs-automount service stopped."
+            ;;
+        restart)
+            sudo systemctl restart wsl-apfs-automount.service
+            log_success "wsl-apfs-automount service restarted."
+            ;;
+        *)
+            log_error "Unknown automount action: $action"
+            echo "Usage: wsl-apfs-mount automount [enable|disable|status|start|stop|restart]"
+            exit 1
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
 # Help & Usage
 # ------------------------------------------------------------------------------
 show_help() {
@@ -455,6 +497,7 @@ Commands:
   unmount [dir]           Unmount APFS partition (alias: umount)
   status                  Show active APFS mounts and disk usage
   list                    Scan and list APFS drives on WSL and Windows host
+  automount <action>      Manage systemd auto-mount service (enable|disable|status)
   install-deps            Install build prerequisites and compile apfs-fuse
   version                 Show version and AI disclosure
   help                    Show this help message
@@ -465,6 +508,7 @@ Examples:
   wsl-apfs-mount mount /dev/sde1 /mnt/my_passport
   wsl-apfs-mount status
   wsl-apfs-mount unmount
+  sudo wsl-apfs-mount automount enable
 
 EOF
 }
@@ -488,6 +532,9 @@ main() {
             ;;
         list|-l)
             cmd_list
+            ;;
+        automount)
+            cmd_automount "$@"
             ;;
         install-deps)
             cmd_install_deps
