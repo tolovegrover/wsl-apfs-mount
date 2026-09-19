@@ -282,18 +282,87 @@ cmd_mount() {
         done < <(lsblk -lpno NAME | grep -E '/dev/sd[a-z]+[0-9]+' || true)
 
         if [ ${#candidates[@]} -eq 0 ]; then
-            log_error "No APFS partition found in WSL block devices!"
-            echo ""
-            echo -e "If your drive is connected via USB to Windows, attach it to WSL first using:"
-            echo -e "  ${BOLD}usbipd.exe attach --wsl -b <BUSID>${NC}"
-            echo -e "Or for a physical disk attached via Windows:"
-            echo -e "  ${BOLD}wsl.exe --mount \\\\.\\PHYSICALDRIVE<N> --bare${NC}"
-            echo ""
-            echo -e "Run ${BOLD}wsl-apfs-mount list${NC} to view available devices and BUSIDs."
-            exit 1
-        elif [ ${#candidates[@]} -eq 1 ]; then
+            log_warn "No APFS partition currently attached inside WSL."
+            log_info "Checking Windows host for connected APFS / USB storage devices..."
+
+            local usbipd_cmd
+            usbipd_cmd=$(get_usbipd_path)
+            local attached_busid=""
+
+            if [ -n "$usbipd_cmd" ]; then
+                local usb_lines
+                usb_lines=$("$usbipd_cmd" list </dev/null 2>/dev/null | grep -E '^[0-9]+-[0-9]+.*Mass Storage' || true)
+
+                if [ -n "$usb_lines" ]; then
+                    local busids=()
+                    local descs=()
+                    while IFS= read -r uline; do
+                        local b_id
+                        b_id=$(echo "$uline" | awk '{print $1}')
+                        local desc
+                        desc=$(echo "$uline" | awk '{$1=$2=""; print $0}' | sed 's/^[ \t]*//')
+                        busids+=("$b_id")
+                        descs+=("$desc")
+                    done <<< "$usb_lines"
+
+                    if [ ${#busids[@]} -eq 1 ]; then
+                        log_info "Found USB drive: ${BOLD}${busids[0]}${NC} - ${descs[0]}"
+                        attached_busid="${busids[0]}"
+                    else
+                        log_warn "Multiple USB storage devices detected on Windows:"
+                        for i in "${!busids[@]}"; do
+                            echo "  [$i] ${busids[$i]} - ${descs[$i]}"
+                        done
+                        read -rp "Select USB device to attach (0-$((${#busids[@]}-1))): " uchoice
+                        attached_busid="${busids[$uchoice]}"
+                    fi
+
+                    # Check if device needs bind
+                    local state
+                    state=$("$usbipd_cmd" list </dev/null 2>/dev/null | grep "^$attached_busid" | awk '{print $NF}' || true)
+                    if [ "$state" = "shared" ] || [ "$state" = "Shared" ]; then
+                        log_info "Device $attached_busid is shared. Attaching to WSL..."
+                    else
+                        log_info "Requesting Administrator elevation on Windows to share device $attached_busid..."
+                        local ps_cmd
+                        ps_cmd=$(get_powershell_path)
+                        if [ -n "$ps_cmd" ]; then
+                            "$ps_cmd" -NoProfile -NonInteractive -Command "Start-Process powershell -ArgumentList '-NoProfile -Command usbipd bind --busid $attached_busid' -Verb RunAs -Wait" </dev/null 2>/dev/null || true
+                        fi
+                    fi
+
+                    log_info "Attaching USB device $attached_busid to WSL..."
+                    "$usbipd_cmd" attach --wsl -b "$attached_busid" </dev/null 2>/dev/null || true
+                    log_info "Waiting for kernel to register block device..."
+                    sleep 3
+
+                    # Rescan block devices
+                    while IFS= read -r dev; do
+                        if [ -n "$dev" ]; then
+                            if sudo blkid "$dev" 2>/dev/null | grep -qi "apfs"; then
+                                candidates+=("$dev")
+                            fi
+                        fi
+                    done < <(lsblk -lpno NAME | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+                fi
+            fi
+
+            if [ ${#candidates[@]} -eq 0 ]; then
+                log_error "No APFS partition found."
+                echo ""
+                echo -e "If your drive is connected via USB to Windows, attach it using:"
+                echo -e "  ${BOLD}usbipd.exe attach --wsl -b <BUSID>${NC}"
+                echo -e "Or for a physical disk attached via Windows:"
+                echo -e "  ${BOLD}wsl.exe --mount \\\\.\\PHYSICALDRIVE<N> --bare${NC}"
+                echo ""
+                echo -e "Run ${BOLD}wsl-apfs-mount list${NC} to view available devices and BUSIDs."
+                exit 1
+            fi
+        fi
+
+        if [ ${#candidates[@]} -eq 1 ]; then
             device="${candidates[0]}"
-            log_info "Auto-detected APFS partition: ${BOLD}$device${NC}"
+            log_info "Target APFS partition: ${BOLD}$device${NC}"
         else
             log_warn "Multiple APFS partitions found:"
             for i in "${!candidates[@]}"; do
@@ -324,13 +393,25 @@ cmd_mount() {
     if sudo apfs-fuse -o "uid=$uid,gid=$gid,allow_other" "$device" "$mountpoint"; then
         log_success "APFS drive mounted successfully!"
         echo ""
-        echo -e "  ${BOLD}Mount Point:${NC}  ${CYAN}$mountpoint${NC}"
-        echo -e "  ${BOLD}Access Mode:${NC}  ${GREEN}Read-Only (ro)${NC}"
-        echo -e "  ${BOLD}Owner/Group:${NC}  ${uid}:${gid} ($(id -un):$(id -gn))"
-        echo -e "  ${BOLD}File Path:${NC}    ${CYAN}${BOLD}$mountpoint/root${NC}"
+        echo -e "  ${BOLD}Mount Point:${NC}    ${CYAN}$mountpoint${NC}"
+        echo -e "  ${BOLD}Access Mode:${NC}    ${GREEN}Read-Only (ro)${NC}"
+        echo -e "  ${BOLD}Owner/Group:${NC}    ${uid}:${gid} ($(id -un):$(id -gn))"
+        echo -e "  ${BOLD}WSL Path:${NC}       ${CYAN}${BOLD}$mountpoint/root${NC}"
+
+        local win_path=""
+        if command -v wslpath >/dev/null 2>&1; then
+            win_path=$(wslpath -w "$mountpoint/root" 2>/dev/null || true)
+            if [ -n "$win_path" ]; then
+                echo -e "  ${BOLD}Windows Path:${NC}   ${CYAN}${BOLD}$win_path${NC}"
+            fi
+        fi
         echo ""
-        echo -e "You can now browse your files directly:"
+        echo -e "Browse your files directly in WSL:"
         echo -e "  ${BOLD}cd $mountpoint/root && ls -la${NC}"
+        if [ -n "$win_path" ]; then
+            echo -e "Or browse directly in Windows File Explorer via:"
+            echo -e "  ${BOLD}$win_path${NC}"
+        fi
     else
         log_error "Failed to mount $device to $mountpoint."
         echo -e "Check dmesg for details: ${BOLD}dmesg | tail -n 20${NC}"

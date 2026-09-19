@@ -1,10 +1,10 @@
 # wsl-apfs-mount 🍏🐧
 
-> **A simple, safe, and generic utility to detect, attach, and mount Apple APFS drives into Windows Subsystem for Linux (WSL2) in read-only mode.**
+> **A simple, safe, and generic utility to detect, attach, and mount Apple APFS drives into Windows Subsystem for Linux (WSL2) in read-only mode — with dual Bash and PowerShell interfaces.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform](https://img.shields.io/badge/Platform-WSL2%20%7C%20Linux-blue.svg)]()
-[![Mode](https://img.shields.io/badge/Mount%20Mode-Strict%20Read--Only-green.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-WSL2%20%7C%20Windows%20PowerShell-blue.svg)]()
+[![Mount Mode](https://img.shields.io/badge/Mount%20Mode-Strict%20Read--Only-green.svg)]()
 [![Built With AI](https://img.shields.io/badge/Engineered%20With-AI%20(Google%20DeepMind)-8A2BE2.svg)]()
 
 ---
@@ -13,24 +13,18 @@
 > ### 🤖 Full AI Disclosure
 > This software was conceptualized, designed, architected, and coded entirely by AI (**Antigravity** by the Google DeepMind team) in an interactive pair-programming session with [Love Grover (@tolovegrover)](https://github.com/tolovegrover).
 >
-> The code, automation pipelines, compatibility patches, and documentation were generated autonomously and verified on real hardware against a 5 TB APFS external drive in WSL2.
+> All scripts, automation routines, compatibility patches, and documentation were generated autonomously and verified against a physical 5 TB APFS external drive in WSL2.
 
 ---
 
-## The Problem
+## Key Highlights
 
-Apple's APFS (Apple File System) is the default filesystem for modern macOS external drives, SSDs, and USB disks. However:
-1. **Windows** has zero native support for APFS.
-2. **WSL2** kernels do not include in-tree APFS kernel drivers by default.
-3. Attempting to mount external drives directly using Windows Hyper-V SCSI pass-through (`wsl --mount`) frequently triggers `hv_storvsc` SCSI `CHECK CONDITION` errors on USB mass storage devices.
-4. Experimental write-capable Linux APFS drivers carry a substantial risk of corrupting macOS volume structures and snapshots.
-
-## The Solution
-
-`wsl-apfs-mount` automates the entire end-to-end workflow safely:
-- **Direct USB Pass-Through**: Bridges the external drive directly from Windows into WSL2 using `usbipd-win`, bypassing buggy Windows filesystem hooks and Hyper-V SCSI translation.
-- **FUSE Userspace Isolation**: Leverages `apfs-fuse`, mounting the filesystem entirely in userspace with strict **read-only (`ro`)** semantics.
-- **Seamless Permissions**: Automatically maps macOS file ownership to your local WSL user (`uid` / `gid`), giving you instant access without requiring `sudo` for browsing.
+- **Direct End-to-End Mounting**: Run a single command (`wsl-apfs-mount mount` or `.\wsl-apfs-mount.ps1 mount`) to automatically find your external APFS drive on Windows, forward it to WSL2 via `usbipd-win`, and mount it read-only.
+- **Dual CLI Interfaces**:
+  - 🐧 **Linux / WSL2**: Native Bash CLI (`wsl-apfs-mount`) installed in your PATH.
+  - 🪟 **Windows PowerShell**: Native PowerShell companion (`wsl-apfs-mount.ps1`) for launching and mounting directly from Windows without opening a Linux terminal.
+- **Windows File Explorer Integration**: Access your files in WSL at `/mnt/apfs/root` or in Windows at `\\wsl.localhost\<distro>\mnt\apfs\root`. Launching with `-Explore` opens Explorer immediately!
+- **Strict Read-Only (`ro`) Safety**: Powered by `apfs-fuse` in userspace, ensuring zero risk of partition table or snapshot corruption on your macOS drives.
 
 ---
 
@@ -38,123 +32,119 @@ Apple's APFS (Apple File System) is the default filesystem for modern macOS exte
 
 ```mermaid
 flowchart TD
-    subgraph WindowsHost["Windows Host"]
+    subgraph Windows["Windows Host (PowerShell or Terminal)"]
         A["External APFS Drive\n(USB / External HDD / SSD)"] --> B["usbipd-win\n(Direct USB Pass-through)"]
+        PS["wsl-apfs-mount.ps1\n(Native PowerShell Launcher)"] --> B
+        PS -->|Triggers| E
+        WinExp["Windows File Explorer\n\\\\wsl.localhost\\distro\\mnt\\apfs\\root"] -.->|Browse Files| F
     end
 
-    subgraph WSL2["WSL 2 Environment (Arch / Ubuntu / Debian / Fedora)"]
-        B ==>|vhci_hcd USB-IP| C["Linux Block Device\n(/dev/sde1, blkid TYPE=apfs)"]
-        C --> D["apfs-fuse\n(FUSE User-space Driver)"]
-        D -->|Strict Read-Only| E["Mount Point\n/mnt/apfs/root"]
+    subgraph WSL2["WSL2 Environment (Arch / Ubuntu / Debian / Fedora)"]
+        B ==>|vhci_hcd SuperSpeed USB| C["Linux Block Device\n(/dev/sde1, blkid TYPE=apfs)"]
+        E["wsl-apfs-mount\n(Bash CLI Utility)"] --> D["apfs-fuse\n(FUSE User-space Driver)"]
+        C --> D
+        D -->|Strict Read-Only| F["Mount Point\n/mnt/apfs/root"]
     end
-
-    E --> F["Your WSL2 Terminal / Scripts / Projects"]
 ```
 
 ---
 
-## Quickstart
+## Installation
 
-### 1. One-Liner Install (in WSL)
+### Method 1: In WSL (Linux)
+
+Install the global CLI utility into `/usr/local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tolovegrover/wsl-apfs-mount/main/install.sh | bash
 ```
 
-### 2. Install Build Prerequisites & Driver
-
-Compile `apfs-fuse` (including automatic patches for modern GCC 15/16 `<cstdint>` standards):
-
+Then install build tools and driver dependencies (one time):
 ```bash
 wsl-apfs-mount install-deps
 ```
 
-*Supported distros: Arch Linux, Ubuntu, Debian, Pop!_OS, Linux Mint, Fedora, RHEL.*
+### Method 2: In Windows (PowerShell)
 
----
-
-## Usage
-
-### 1. Scan for APFS Drives
-To scan both your WSL block devices and connected Windows USB/physical disks:
-
-```bash
-wsl-apfs-mount list
-```
-
-Example output:
-```
-[*] Scanning for APFS partitions and attached drives...
-
-1. Block Devices in WSL:
-  ● /dev/sde1 [APFS] Size: 4.5T | Label: "My Passport" | UUID: 37bcda11-0490-4bc5-8b97-05da4331c1c9
-
-2. USB Devices (usbipd-win):
-Connected:
-BUSID  VID:PID    DEVICE                                STATE
-1-17   1058:2626  USB Mass Storage Device               Attached
-```
-
----
-
-### 2. Mount Your Drive
-
-If your drive is already attached to WSL:
-```bash
-wsl-apfs-mount mount
-```
-*`wsl-apfs-mount` will automatically detect the APFS partition and mount it to `/mnt/apfs`.*
-
-To specify a custom partition or mount directory:
-```bash
-wsl-apfs-mount mount /dev/sde1 /mnt/my_passport
-```
-
-#### Attaching USB Drives from Windows to WSL:
-If your drive is plugged into Windows, attach it to WSL using `usbipd-win`:
+Clone or download the repository:
 ```powershell
-# In PowerShell (Admin once to share, then standard user):
-usbipd bind --busid <BUSID>
-usbipd attach --wsl --busid <BUSID>
+git clone https://github.com/tolovegrover/wsl-apfs-mount.git
+cd wsl-apfs-mount
 ```
-Then run `wsl-apfs-mount mount` inside your WSL terminal!
+
+Ensure `usbipd-win` is installed (if not already installed):
+```powershell
+winget install dorssel.usbipd-win
+```
 
 ---
 
-### 3. Check Status & Browse Files
+## Direct Usage
 
-```bash
-wsl-apfs-mount status
+### Option A: From Windows PowerShell
+
+Simply run:
+```powershell
+# Automatically detect, forward, and mount your APFS drive
+.\wsl-apfs-mount.ps1 mount
+
+# Mount and immediately open in Windows File Explorer:
+.\wsl-apfs-mount.ps1 mount -Explore
+
+# Check mount status:
+.\wsl-apfs-mount.ps1 status
+
+# Scan for connected APFS drives:
+.\wsl-apfs-mount.ps1 list
+
+# Safely unmount when done:
+.\wsl-apfs-mount.ps1 unmount
 ```
 
-Browse files directly (no root required!):
+---
+
+### Option B: From WSL2 (Linux Terminal)
+
 ```bash
+# 1. Directly mount the APFS drive (auto-detects and forwards from Windows if needed)
+wsl-apfs-mount mount
+
+# 2. Check active mounts and disk metrics
+wsl-apfs-mount status
+
+# 3. Browse your files (no sudo required!)
 cd /mnt/apfs/root
 ls -la
-```
 
----
-
-### 4. Unmount When Finished
-
-```bash
+# 4. Safely unmount when finished
 wsl-apfs-mount unmount
-# or: wsl-apfs-mount umount /mnt/my_passport
 ```
 
 ---
 
 ## Command Reference
 
+### Bash CLI (`wsl-apfs-mount`)
+
 | Command | Description |
 | :--- | :--- |
-| `wsl-apfs-mount list` | Scan and list APFS partitions in WSL & on Windows host |
-| `wsl-apfs-mount mount [device] [dir]` | Mount APFS partition read-only (default: `/mnt/apfs`) |
+| `wsl-apfs-mount mount [device] [dir]` | Mount APFS partition read-only (auto-detects and attaches if needed) |
 | `wsl-apfs-mount unmount [dir]` | Safely unmount APFS partition (`umount` alias supported) |
 | `wsl-apfs-mount status` | Display active APFS mounts, device names, and disk usage |
+| `wsl-apfs-mount list` | Scan and list APFS partitions in WSL & on Windows host |
 | `wsl-apfs-mount install-deps` | Auto-install distro packages and compile `apfs-fuse` |
 | `wsl-apfs-mount version` | Print version and AI disclosure info |
 | `wsl-apfs-mount help` | Show usage manual |
+
+### PowerShell Launcher (`wsl-apfs-mount.ps1`)
+
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `Command` | `string` | Action: `mount`, `unmount`, `status`, `list`, `install-deps` (default: `mount`) |
+| `-BusId` | `string` | Optional USB Bus ID (e.g. `1-17`). Auto-detected if omitted |
+| `-MountPoint` | `string` | Target directory in WSL (default: `/mnt/apfs`) |
+| `-Distro` | `string` | Target WSL distribution (auto-detects active default) |
+| `-Explore` | `switch` | Opens Windows File Explorer directly to the mounted folder upon success |
 
 ---
 
@@ -165,7 +155,7 @@ wsl-apfs-mount unmount
 
 `wsl-apfs-mount` guarantees:
 - **100% Read-Only**: Utilizes `apfs-fuse`, which strictly omits write capabilities.
-- **Non-Destructive**: Zero modifications are ever performed on partition tables, superblock metadata, or volume containers.
+- **Non-Destructive**: Zero modifications are performed on partition tables, superblock metadata, or volume containers.
 - **Crash Safe**: Disconnecting or unmounting cannot cause data corruption on the source drive.
 
 ---
@@ -175,12 +165,9 @@ wsl-apfs-mount unmount
 <details>
 <summary><b>1. Error: "Reading block 0 from main device failed" or SCSI CHECK CONDITION</b></summary>
 
-If attaching via `wsl --mount \\.\PHYSICALDRIVE<N> --bare` results in Hyper-V SCSI errors (`hv_storvsc` tag cmd 0x88 check condition), use [usbipd-win](https://github.com/dorssel/usbipd-win) instead:
-```cmd
-usbipd bind -b <BUSID>
-usbipd attach --wsl -b <BUSID>
-```
-Direct USB pass-through bypasses Windows storage controller hooks and Hyper-V SCSI driver limitations.
+Hyper-V's native SCSI storage pass-through (`wsl --mount \\.\PHYSICALDRIVE<N> --bare`) frequently fails on external USB drives with `CHECK CONDITION` errors (`hv_storvsc` command 0x88). 
+
+`wsl-apfs-mount` solves this by using [usbipd-win](https://github.com/dorssel/usbipd-win) for direct USB protocol forwarding, bypassing the buggy Windows storage translation layer.
 </details>
 
 <details>
@@ -190,13 +177,16 @@ Recent GCC versions (15 and 16) cleaned up standard header transitive includes, 
 </details>
 
 <details>
-<summary><b>3. Permission denied accessing /mnt/apfs</b></summary>
+<summary><b>3. PowerShell Execution Policy Restriction</b></summary>
 
-Ensure `/etc/fuse.conf` contains the uncommented directive:
-```text
-user_allow_other
+If Windows blocks executing PowerShell scripts, run:
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
-`wsl-apfs-mount install-deps` sets this up automatically.
+Or launch with bypass:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\wsl-apfs-mount.ps1 mount
+```
 </details>
 
 ---
