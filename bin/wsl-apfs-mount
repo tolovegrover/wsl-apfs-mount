@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# wsl-apfs-mount
+# ------------------------------------------------------------------------------
+# Simple, robust utility to detect, attach, and mount Apple APFS drives
+# into Windows Subsystem for Linux (WSL2) in read-only mode.
+#
+# FULL AI DISCLOSURE:
+# This software was conceptualized, designed, and implemented entirely by
+# AI (Antigravity by Google DeepMind) in an interactive pair-programming session
+# with Love Grover (@tolovegrover).
+#
+# License: MIT License
+# ==============================================================================
+
+set -euo pipefail
+
+VERSION="1.0.0"
+DEFAULT_MOUNTPOINT="/mnt/apfs"
+
+# Colors for terminal output
+BOLD='\033[1m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# ------------------------------------------------------------------------------
+# UI Helpers
+# ------------------------------------------------------------------------------
+print_banner() {
+    cat << "EOF"
+ _       ______  __       ___    ____  ______ _____ 
+| |     / / __ \/ /      /   |  / __ \/ ____// ___/ 
+| | /| / / /_/ / /      / /| | / /_/ / /_    \__ \  
+| |/ |/ /\__, / /___   / ___ |/ ____/ __/   ___/ /  
+|__/|__//____/_____/  /_/  |_/_/   /_/     /____/   
+                                 MOUNT (WSL2)
+EOF
+    echo -e "${DIM}Version ${VERSION} | Read-Only Apple APFS Drive Mounter for WSL2${NC}"
+    echo -e "${CYAN}🤖 Full AI Disclosure: Engineered by AI (Google DeepMind Antigravity) & @tolovegrover${NC}\n"
+}
+
+log_info() {
+    echo -e "${BLUE}[*]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[✗]${NC} $1" >&2
+}
+
+# ------------------------------------------------------------------------------
+# Dependency Verification
+# ------------------------------------------------------------------------------
+check_apfs_fuse() {
+    if ! command -v apfs-fuse >/dev/null 2>&1; then
+        log_error "'apfs-fuse' is not installed."
+        echo -e "Run ${BOLD}wsl-apfs-mount install-deps${NC} to automatically compile and install it."
+        exit 1
+    fi
+}
+
+get_powershell_path() {
+    if command -v powershell.exe >/dev/null 2>&1; then
+        echo "powershell.exe"
+    elif [ -x "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" ]; then
+        echo "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    else
+        echo ""
+    fi
+}
+
+get_usbipd_path() {
+    if command -v usbipd.exe >/dev/null 2>&1; then
+        echo "usbipd.exe"
+    elif [ -x "/mnt/c/Program Files/usbipd-win/usbipd.exe" ]; then
+        echo "/mnt/c/Program Files/usbipd-win/usbipd.exe"
+    else
+        echo ""
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: install-deps
+# ------------------------------------------------------------------------------
+cmd_install_deps() {
+    print_banner
+    log_info "Detecting Linux distribution and installing dependencies..."
+
+    local distro=""
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        distro=$(source /etc/os-release && echo "$ID")
+    fi
+
+    case "$distro" in
+        arch|manjaro|endeavouros)
+            log_info "Detected Arch-based distribution."
+            sudo pacman -Sy --noconfirm base-devel cmake fuse3 git zlib bzip2
+            ;;
+        ubuntu|debian|pop|mint)
+            log_info "Detected Debian/Ubuntu-based distribution."
+            sudo apt-get update
+            sudo apt-get install -y build-essential cmake libfuse3-dev libbz2-dev zlib1g-dev git
+            ;;
+        fedora|rhel|centos)
+            log_info "Detected Fedora/RHEL-based distribution."
+            sudo dnf install -y gcc-c++ make cmake fuse3-devel bzip2-devel zlib-devel git
+            ;;
+        *)
+            log_warn "Unknown distribution ($distro). Please ensure cmake, make, gcc/g++, fuse3, bzip2, zlib, and git are installed."
+            ;;
+    esac
+
+    # Ensure /etc/fuse.conf has user_allow_other enabled
+    if [ -f /etc/fuse.conf ]; then
+        if ! grep -q "^user_allow_other" /etc/fuse.conf; then
+            log_info "Enabling 'user_allow_other' in /etc/fuse.conf..."
+            echo "user_allow_other" | sudo tee -a /etc/fuse.conf >/dev/null
+        fi
+    fi
+
+    # Build apfs-fuse from source
+    local build_dir
+    build_dir=$(mktemp -d /tmp/apfs-fuse-build.XXXXXX)
+    log_info "Cloning and building apfs-fuse in $build_dir..."
+
+    git clone --recursive https://github.com/sgan81/apfs-fuse.git "$build_dir/apfs-fuse"
+    cd "$build_dir/apfs-fuse"
+
+    # Fix for GCC 15/16 missing <cstdint> in PList.h
+    if [ -f "ApfsLib/PList.h" ] && ! grep -q "<cstdint>" "ApfsLib/PList.h"; then
+        log_info "Applying GCC compatibility patch (<cstdint> in PList.h)..."
+        sed -i 's/#include <memory>/#include <memory>\n#include <cstdint>/' ApfsLib/PList.h
+    fi
+
+    mkdir -p build && cd build
+    cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.10 ..
+    make -j"$(nproc)"
+
+    log_info "Installing binaries to /usr/local/bin..."
+    sudo cp apfs-fuse apfsutil apfs-dump apfs-dump-quick /usr/local/bin/
+
+    # Cleanup
+    rm -rf "$build_dir"
+    log_success "apfs-fuse and dependencies successfully installed!"
+}
+
+# ------------------------------------------------------------------------------
+# Command: list
+# ------------------------------------------------------------------------------
+cmd_list() {
+    print_banner
+    log_info "Scanning for APFS partitions and attached drives..."
+    echo ""
+
+    echo -e "${BOLD}1. Block Devices in WSL:${NC}"
+    local found_wsl_apfs=0
+    while IFS= read -r dev; do
+        if [ -n "$dev" ]; then
+            local blk_info
+            blk_info=$(sudo blkid "$dev" 2>/dev/null || true)
+            if echo "$blk_info" | grep -qi "apfs"; then
+                local label
+                label=$(echo "$blk_info" | grep -o 'PARTLABEL="[^"]*"' | cut -d'"' -f2 || echo "No label")
+                local uuid
+                uuid=$(echo "$blk_info" | grep -E -o '\bUUID="[^"]*"' | head -n1 | cut -d'"' -f2 || echo "Unknown")
+                local size
+                size=$(lsblk -no SIZE "$dev" 2>/dev/null || echo "Unknown")
+                echo -e "  ${GREEN}●${NC} ${BOLD}$dev${NC} [APFS] Size: $size | Label: \"$label\" | UUID: $uuid"
+                found_wsl_apfs=1
+            fi
+        fi
+    done < <(lsblk -lpno NAME | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+
+    if [ "$found_wsl_apfs" -eq 0 ]; then
+        echo -e "  ${DIM}(No APFS partitions currently detected inside WSL block devices)${NC}"
+    fi
+    echo ""
+
+    local ps_cmd
+    ps_cmd=$(get_powershell_path)
+    if [ -n "$ps_cmd" ]; then
+        echo -e "${BOLD}2. Physical Disks on Windows Host:${NC}"
+        local win_disks
+        win_disks=$("$ps_cmd" -NoProfile -NonInteractive -Command "
+            Get-Disk | ForEach-Object {
+                \$d = \$_
+                Get-Partition -DiskNumber \$d.Number -ErrorAction SilentlyContinue | ForEach-Object {
+                    [PSCustomObject]@{
+                        DiskNumber = \$d.Number
+                        Model = \$d.FriendlyName
+                        PartitionNumber = \$_.PartitionNumber
+                        SizeGB = [math]::Round(\$_.Size / 1GB, 1)
+                        GptType = \$_.GptType
+                        IsApfs = (\$_.GptType -eq '{7c3457ef-0000-11aa-aa11-00306543ecac}')
+                    }
+                }
+            } | Where-Object { \$_.IsApfs } | Format-Table -AutoSize
+        " </dev/null 2>/dev/null || true)
+
+        if [ -n "$win_disks" ] && echo "$win_disks" | grep -q "True"; then
+            echo "$win_disks"
+        else
+            echo -e "  ${DIM}(No APFS partitions detected on Windows host or query returned none)${NC}"
+        fi
+        echo ""
+    fi
+
+    local usbipd_cmd
+    usbipd_cmd=$(get_usbipd_path)
+    if [ -n "$usbipd_cmd" ]; then
+        echo -e "${BOLD}3. USB Devices (usbipd-win):${NC}"
+        local usb_list
+        usb_list=$("$usbipd_cmd" list </dev/null 2>/dev/null || true)
+        if [ -n "$usb_list" ]; then
+            echo "$usb_list"
+        fi
+        echo ""
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: status
+# ------------------------------------------------------------------------------
+cmd_status() {
+    print_banner
+    log_info "Checking active APFS mounts..."
+    echo ""
+
+    local active_mounts
+    active_mounts=$(mount -t fuse | grep "apfs" || true)
+
+    if [ -n "$active_mounts" ]; then
+        echo -e "${GREEN}${BOLD}Active APFS Mounts:${NC}"
+        echo "$active_mounts"
+        echo ""
+        echo -e "${BOLD}Filesystem Usage:${NC}"
+        while IFS= read -r line; do
+            local mnt
+            mnt=$(echo "$line" | awk '{print $3}')
+            df -h "$mnt"
+            echo ""
+            echo -e "Browse your files at: ${CYAN}${BOLD}$mnt/root${NC} (or ${CYAN}$mnt${NC})"
+        done <<< "$active_mounts"
+    else
+        log_warn "No active APFS filesystems currently mounted in WSL."
+        echo -e "Use ${BOLD}wsl-apfs-mount mount${NC} to mount your drive."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: mount
+# ------------------------------------------------------------------------------
+cmd_mount() {
+    check_apfs_fuse
+
+    local device="${1:-}"
+    local mountpoint="${2:-$DEFAULT_MOUNTPOINT}"
+
+    # Auto-detect device if not provided
+    if [ -z "$device" ]; then
+        log_info "No device specified. Scanning for attached APFS partitions..."
+        local candidates=()
+        while IFS= read -r dev; do
+            if [ -n "$dev" ]; then
+                if sudo blkid "$dev" 2>/dev/null | grep -qi "apfs"; then
+                    candidates+=("$dev")
+                fi
+            fi
+        done < <(lsblk -lpno NAME | grep -E '/dev/sd[a-z]+[0-9]+' || true)
+
+        if [ ${#candidates[@]} -eq 0 ]; then
+            log_error "No APFS partition found in WSL block devices!"
+            echo ""
+            echo -e "If your drive is connected via USB to Windows, attach it to WSL first using:"
+            echo -e "  ${BOLD}usbipd.exe attach --wsl -b <BUSID>${NC}"
+            echo -e "Or for a physical disk attached via Windows:"
+            echo -e "  ${BOLD}wsl.exe --mount \\\\.\\PHYSICALDRIVE<N> --bare${NC}"
+            echo ""
+            echo -e "Run ${BOLD}wsl-apfs-mount list${NC} to view available devices and BUSIDs."
+            exit 1
+        elif [ ${#candidates[@]} -eq 1 ]; then
+            device="${candidates[0]}"
+            log_info "Auto-detected APFS partition: ${BOLD}$device${NC}"
+        else
+            log_warn "Multiple APFS partitions found:"
+            for i in "${!candidates[@]}"; do
+                echo "  [$i] ${candidates[$i]}"
+            done
+            read -rp "Select index (0-$((${#candidates[@]}-1))): " choice
+            device="${candidates[$choice]}"
+        fi
+    fi
+
+    # Check if already mounted
+    if mount | grep -q "on $mountpoint "; then
+        log_warn "$mountpoint is already mounted."
+        cmd_status
+        return 0
+    fi
+
+    log_info "Preparing mountpoint at: ${BOLD}$mountpoint${NC}"
+    sudo mkdir -p "$mountpoint"
+    sudo chown "$(id -u):$(id -g)" "$mountpoint"
+
+    log_info "Mounting ${BOLD}$device${NC} in ${GREEN}READ-ONLY${NC} mode via apfs-fuse..."
+    local uid
+    uid=$(id -u)
+    local gid
+    gid=$(id -g)
+
+    if sudo apfs-fuse -o "uid=$uid,gid=$gid,allow_other" "$device" "$mountpoint"; then
+        log_success "APFS drive mounted successfully!"
+        echo ""
+        echo -e "  ${BOLD}Mount Point:${NC}  ${CYAN}$mountpoint${NC}"
+        echo -e "  ${BOLD}Access Mode:${NC}  ${GREEN}Read-Only (ro)${NC}"
+        echo -e "  ${BOLD}Owner/Group:${NC}  ${uid}:${gid} ($(id -un):$(id -gn))"
+        echo -e "  ${BOLD}File Path:${NC}    ${CYAN}${BOLD}$mountpoint/root${NC}"
+        echo ""
+        echo -e "You can now browse your files directly:"
+        echo -e "  ${BOLD}cd $mountpoint/root && ls -la${NC}"
+    else
+        log_error "Failed to mount $device to $mountpoint."
+        echo -e "Check dmesg for details: ${BOLD}dmesg | tail -n 20${NC}"
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Command: unmount / umount
+# ------------------------------------------------------------------------------
+cmd_unmount() {
+    local mountpoint="${1:-$DEFAULT_MOUNTPOINT}"
+
+    if ! mount | grep -q "on $mountpoint "; then
+        log_warn "$mountpoint is not currently mounted."
+        return 0
+    fi
+
+    log_info "Unmounting ${BOLD}$mountpoint${NC}..."
+    if command -v fusermount3 >/dev/null 2>&1; then
+        sudo fusermount3 -u "$mountpoint" || sudo umount "$mountpoint"
+    elif command -v fusermount >/dev/null 2>&1; then
+        sudo fusermount -u "$mountpoint" || sudo umount "$mountpoint"
+    else
+        sudo umount "$mountpoint"
+    fi
+
+    log_success "Successfully unmounted $mountpoint."
+}
+
+# ------------------------------------------------------------------------------
+# Help & Usage
+# ------------------------------------------------------------------------------
+show_help() {
+    print_banner
+    cat << EOF
+Usage: wsl-apfs-mount <command> [options]
+
+Commands:
+  mount [device] [dir]    Mount APFS partition read-only (default: /mnt/apfs)
+  unmount [dir]           Unmount APFS partition (alias: umount)
+  status                  Show active APFS mounts and disk usage
+  list                    Scan and list APFS drives on WSL and Windows host
+  install-deps            Install build prerequisites and compile apfs-fuse
+  version                 Show version and AI disclosure
+  help                    Show this help message
+
+Examples:
+  wsl-apfs-mount list
+  wsl-apfs-mount mount
+  wsl-apfs-mount mount /dev/sde1 /mnt/my_passport
+  wsl-apfs-mount status
+  wsl-apfs-mount unmount
+
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Entry Point
+# ------------------------------------------------------------------------------
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        mount|-m)
+            cmd_mount "$@"
+            ;;
+        unmount|umount|-u)
+            cmd_unmount "$@"
+            ;;
+        status|-s)
+            cmd_status
+            ;;
+        list|-l)
+            cmd_list
+            ;;
+        install-deps)
+            cmd_install_deps
+            ;;
+        version|-v|--version)
+            print_banner
+            ;;
+        help|-h|--help)
+            show_help
+            ;;
+        *)
+            log_error "Unknown command: $cmd"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

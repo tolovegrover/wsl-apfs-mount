@@ -1,0 +1,7 @@
+# Build artifacts and temp files
+build/
+*.o
+*.a
+*.log
+.DS_Store
+*~
